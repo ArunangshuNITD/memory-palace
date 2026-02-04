@@ -90,12 +90,14 @@ export default async function MemoryPage({ params }) {
             </div>
         )}
 
-        {/* --- 3. THE PLAYER (Handles Summary + Quiz + Restart) --- */}
+        {/* --- 3. STUDY HUB (Summary, Formulas, Quiz Selection) --- */}
         <section className="animate-in fade-in slide-in-from-bottom-6 duration-700">
           <QuizPlayer 
-             initialQuestions={memory.quiz} 
+             quiz={memory.quiz || []}
+             numericals={memory.numericals || []} 
+             formulas={memory.formulas || []}
+             summary={memory.summary} 
              memoryId={memory._id} 
-             summary={memory.summary} // Passed here to be shown first
           />
         </section>
 

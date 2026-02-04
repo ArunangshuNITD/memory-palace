@@ -9,6 +9,58 @@ import pdf from 'pdf-parse';
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
+/* ---------------- HELPERS ---------------- */
+
+// Safe JSON extractor (handles markdown blocks)
+function extractJsonObjectSafe(text) {
+  const cleaned = text.replace(/```json|```/g, "").trim();
+  const match = cleaned.match(/\{[\s\S]*\}/); // Find first JSON object
+  if (!match) throw new Error("No JSON object found in AI response");
+  return JSON.parse(match[0]);
+}
+
+// Normalizes quiz data (Fixes options and difficulty)
+function normalizeQuiz(quiz = []) {
+  if (!Array.isArray(quiz)) return [];
+  return quiz.map((q) => {
+    if (!q?.question || !Array.isArray(q.options)) return null;
+
+    const options = q.options.map((o) => String(o).trim());
+    let correct = (q.correctAnswer || "").toString().trim();
+
+    // Fix: If answer is "A", map it to options[0]
+    if (/^[A-D]$/i.test(correct)) {
+      const index = correct.toUpperCase().charCodeAt(0) - 65;
+      correct = options[index] ?? options[0];
+    }
+
+    // Fix: Ensure the correct answer string actually exists in options
+    const matchedOption = options.find((opt) => opt.toLowerCase() === correct.toLowerCase()) || options[0];
+
+    return {
+      question: q.question.trim(),
+      options,
+      correctAnswer: matchedOption,
+      explanation: q.explanation?.trim() || "",
+      difficulty: ["easy", "medium", "hard"].includes(q.difficulty) ? q.difficulty : "medium",
+    };
+  }).filter(Boolean);
+}
+
+// Normalizes numerical sets
+function normalizeNumericals(numericals = []) {
+    if (!Array.isArray(numericals)) return [];
+    return numericals.map(set => {
+        if (!set.relatedFormula || !Array.isArray(set.problems)) return null;
+        return {
+            relatedFormula: set.relatedFormula,
+            problems: normalizeQuiz(set.problems) // Reuse quiz logic
+        };
+    }).filter(Boolean);
+}
+
+/* ---------------- MAIN HANDLER ---------------- */
+
 export async function POST(req) {
   try {
     // 1. Connect to Database
@@ -21,12 +73,11 @@ export async function POST(req) {
 
     if (!file) return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
 
-    // Convert file to buffer for processing
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     let extractedText = "";
 
-    // 3. Extract Text (Deepgram or PDF Parse)
+    // 3. Extract Text
     console.log("🔍 Extracting text from", fileType);
     
     if (fileType === 'video') {
@@ -43,51 +94,80 @@ export async function POST(req) {
       extractedText = pdfData.text;
     }
 
-    // 4. SAVE TO DB (Initial Save)
-    console.log("💾 Saving raw text to MongoDB...");
-    const newMemory = await Memory.create({
-      title: file.name,
-      mediaType: fileType,
-      extractedText: extractedText, 
-    });
+    // Truncate text to fit context window if necessary
+    extractedText = extractedText.substring(0, 30000);
 
-    // 5. GENERATE AI CONTENT (Gemini)
+    // 4. GENERATE AI CONTENT
     console.log("🧠 Sending to Gemini...");
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     
+    // UPDATED PROMPT: Now asks for Formulas, Numericals, Summary, and Roadmap
     const prompt = `
       You are an expert teacher. Analyze this text and return a valid JSON object.
-      Do not wrap in markdown.
-      Structure:
+      
+      STRUCTURE REQUIREMENTS:
+      1. **formulas**: Extract key mathematical formulas { "expression": "E=mc^2", "description": "..." }.
+      2. **quiz**: Exactly 5 conceptual multiple-choice questions (Theory).
+         - Difficulty: 2 Easy, 2 Medium, 1 Hard.
+      3. **numericals**: 
+         - IF formulas are found: Create a set for EACH formula.
+         - Inside each set: Exactly 6 math problems (1 Easy, 4 Medium, 1 Hard).
+         - IF NO formulas: Return empty array [].
+      4. **summary**: Concise summary.
+      5. **roadmap**: Learning steps.
+
+      JSON FORMAT ONLY (No Markdown):
       {
-        "patterns": ["concept 1", "concept 2", "concept 3", "concept 4", "concept 5"],
+        "summary": "...",
+        "patterns": ["concept1", "concept2"],
+        "formulas": [ { "expression": "...", "description": "..." } ],
         "quiz": [
+          { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "difficulty": "medium", "explanation": "..." }
+        ],
+        "numericals": [
           {
-            "question": "Question text?",
-            "options": ["A", "B", "C", "D"],
-            "correctAnswer": "The correct option string"
-          },
-          {...},
-          {...}
-        ]
+            "relatedFormula": "F = m*a",
+            "problems": [ ...same structure as quiz... ]
+          }
+        ],
+        "roadmap": [ { "step": 1, "title": "...", "description": "..." } ]
       }
       
       Text to analyze:
-      ${extractedText.substring(0, 30000)} 
+      ${extractedText}
     `;
 
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const textResponse = response.text();
+    const textResponse = result.response.text();
     
-    // Clean and Parse JSON
-    const cleanedJson = textResponse.replace(/```json|```/g, '').trim();
-    const aiData = JSON.parse(cleanedJson);
+    // 5. Parse and Normalize Data
+    let aiData;
+    try {
+        aiData = extractJsonObjectSafe(textResponse);
+    } catch (e) {
+        console.error("JSON Parse Error", e);
+        // Fallback to basic object if AI fails completely
+        aiData = { summary: "AI generation failed", quiz: [], formulas: [], numericals: [] };
+    }
 
-    // 6. UPDATE DB with AI Results
-    newMemory.patterns = aiData.patterns;
-    newMemory.quiz = aiData.quiz;
-    await newMemory.save();
+    // 6. SAVE TO DB (One-shot create)
+    console.log("💾 Saving to MongoDB...");
+    
+    const newMemory = await Memory.create({
+      title: file.name,
+      mediaType: fileType,
+      extractedText: extractedText,
+      
+      // Mapped Fields
+      summary: aiData.summary || "",
+      patterns: aiData.patterns || [],
+      formulas: aiData.formulas || [],
+      roadmap: aiData.roadmap || [],
+      
+      // Normalized Fields (Important for UI stability)
+      quiz: normalizeQuiz(aiData.quiz),
+      numericals: normalizeNumericals(aiData.numericals),
+    });
 
     console.log("✅ Success! Memory ID:", newMemory._id);
     
