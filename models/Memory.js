@@ -1,83 +1,27 @@
 import mongoose from "mongoose";
 
 const MemorySchema = new mongoose.Schema({
-  /* -------------------------------------------------- */
-  /* 1. Upload Metadata                                */
-  /* -------------------------------------------------- */
-  title: {
-    type: String,
-    required: [true, "Please provide a title"],
-    trim: true,
-  },
-
-  mediaType: {
-    type: String,
-    enum: ["pdf", "video"],
-    required: true,
-  },
-
-  mediaUrl: {
-    type: String,
-    required: true,
-  },
-
-  /* -------------------------------------------------- */
-  /* 2. Extracted Raw Text                              */
-  /* -------------------------------------------------- */
-  extractedText: {
-    type: String,
-    required: true,
-    trim: true,
-    default: "No readable text could be extracted from this file.",
-  },
-
-  /* -------------------------------------------------- */
-  /* 3. AI Generated Summary                            */
-  /* -------------------------------------------------- */
-  summary: {
-    type: String,
-    default: "No summary available.",
-  },
-
-  /* -------------------------------------------------- */
-  /* 4. AI Generated Patterns / Tags                    */
-  /* -------------------------------------------------- */
-  patterns: {
-    type: [String],
-    default: [],
-  },
-
-  /* -------------------------------------------------- */
-  /* 5. AI Generated Quiz                               */
-  /* -------------------------------------------------- */
+  title: { type: String, required: true },
+  mediaType: { type: String, enum: ["pdf", "video"], required: true },
+  mediaUrl: { type: String, required: true },
+  extractedText: { type: String, required: true },
+  summary: { type: String, default: "" },
+  patterns: { type: [String], default: [] },
+  
+  // Updated Quiz Sub-document
   quiz: [
     {
-      question: { type: String },
-      options: { type: [String] },
-      correctAnswer: { type: String },
+      question: { type: String, required: true },
+      options: { type: [String], required: true },
+      correctAnswer: { type: String, required: true }, // Will store full text
       explanation: { type: String },
     },
   ],
 
-  /* -------------------------------------------------- */
-  /* 6. Learning Roadmap (Optional)                     */
-  /* -------------------------------------------------- */
   roadmap: [
-    {
-      step: Number,
-      title: String,
-      description: String,
-    },
+    { step: Number, title: String, description: String },
   ],
-
-  /* -------------------------------------------------- */
-  /* 7. Timestamp                                      */
-  /* -------------------------------------------------- */
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
+  createdAt: { type: Date, default: Date.now },
 });
 
-export default mongoose.models.Memory ||
-  mongoose.model("Memory", MemorySchema);
+export default mongoose.models.Memory || mongoose.model("Memory", MemorySchema);

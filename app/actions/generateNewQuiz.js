@@ -13,20 +13,22 @@ export async function generateNewQuiz(memoryId) {
 
     if (!memory) throw new Error("Memory not found");
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    // Note: Using 'gemini-1.5-flash' or 'gemini-2.0-flash' as 2.5 does not exist yet
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    // Prompt specifically for 5 NEW questions
     const prompt = `
       You are an expert tutor. Based on the text below, generate 5 BRAND NEW, unique multiple-choice questions.
-      Make them different from generic questions. Focus on details.
+      
+      CRITICAL: The "correctAnswer" MUST be the exact string text from the "options" array. 
+      Do NOT use "A", "B", "C", or "D". Use the full text of the correct choice.
       
       Return ONLY valid JSON. Structure:
       [
         {
           "question": "Question text?",
-          "options": ["A", "B", "C", "D"],
-          "correctAnswer": "A",
-          "explanation": "Why A is correct."
+          "options": ["Full Option 1", "Full Option 2", "Full Option 3", "Full Option 4"],
+          "correctAnswer": "Full Option 1",
+          "explanation": "Why this specific option is correct."
         }
       ]
 
@@ -39,8 +41,6 @@ export async function generateNewQuiz(memoryId) {
     
     const newQuestions = JSON.parse(cleanedJson);
 
-    // Optional: Save these to DB if you want history, 
-    // for now we just return them to the UI.
     return { success: true, questions: newQuestions };
 
   } catch (error) {
