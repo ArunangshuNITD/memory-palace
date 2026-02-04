@@ -11,15 +11,42 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 /* ---------------- HELPERS ---------------- */
 
-// Safe JSON extractor (handles markdown blocks)
-function extractJsonObjectSafe(text) {
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  const match = cleaned.match(/\{[\s\S]*\}/); // Find first JSON object
-  if (!match) throw new Error("No JSON object found in AI response");
-  return JSON.parse(match[0]);
+// 🔧 THE FIX: A Robust JSON Cleaner for AI Responses
+function cleanAndParseJSON(text) {
+  // 1. Remove Markdown code blocks (```json ... ```)
+  let cleaned = text.replace(/```json|```/g, "").trim();
+
+  // 2. Extract just the JSON object (from first { to last })
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  
+  // If no JSON found, throw error to trigger the catch block
+  if (start === -1 || end === -1) throw new Error("No JSON object found");
+  
+  cleaned = cleaned.substring(start, end + 1);
+
+  try {
+    // Attempt 1: Direct Parse
+    return JSON.parse(cleaned);
+  } catch (e) {
+    console.log("⚠️ Direct JSON parse failed (likely LaTeX). Attempting to sanitize...");
+
+    // 3. SANITIZATION: Fix common AI JSON mistakes
+    // This Regex finds backslashes (\) that are NOT followed by valid JSON escape chars 
+    // and turns them into double backslashes (\\). 
+    // Example: "\sigma" becomes "\\sigma"
+    const sanitized = cleaned.replace(/\\(?![/u"\\bfnrt])/g, '\\\\');
+
+    try {
+      return JSON.parse(sanitized);
+    } catch (e2) {
+      console.error("❌ Fatal JSON Parse Error. Raw Text:", text);
+      throw new Error("Failed to parse AI response.");
+    }
+  }
 }
 
-// Normalizes quiz data (Fixes options and difficulty)
+// Normalize Quiz Data
 function normalizeQuiz(quiz = []) {
   if (!Array.isArray(quiz)) return [];
   return quiz.map((q) => {
@@ -28,13 +55,13 @@ function normalizeQuiz(quiz = []) {
     const options = q.options.map((o) => String(o).trim());
     let correct = (q.correctAnswer || "").toString().trim();
 
-    // Fix: If answer is "A", map it to options[0]
+    // Map "A/B/C/D" to actual option text
     if (/^[A-D]$/i.test(correct)) {
       const index = correct.toUpperCase().charCodeAt(0) - 65;
       correct = options[index] ?? options[0];
     }
-
-    // Fix: Ensure the correct answer string actually exists in options
+    
+    // Ensure correct answer matches one of the options
     const matchedOption = options.find((opt) => opt.toLowerCase() === correct.toLowerCase()) || options[0];
 
     return {
@@ -47,7 +74,7 @@ function normalizeQuiz(quiz = []) {
   }).filter(Boolean);
 }
 
-// Normalizes numerical sets
+// Normalize Numerical Data
 function normalizeNumericals(numericals = []) {
     if (!Array.isArray(numericals)) return [];
     return numericals.map(set => {
@@ -69,22 +96,18 @@ export async function POST(req) {
     // 2. Handle File Upload
     const formData = await req.formData();
     const file = formData.get('file');
-    const fileType = formData.get('type'); // "video" or "pdf"
+    const fileType = formData.get('type'); 
 
     if (!file) return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const buffer = Buffer.from(await file.arrayBuffer());
     let extractedText = "";
 
     // 3. Extract Text
     console.log("🔍 Extracting text from", fileType);
-    
     if (fileType === 'video') {
       const { result, error } = await deepgram.listen.prerecorded.transcribeFile(buffer, {
-        model: "nova-2",
-        smart_format: true,
-        punctuate: true,
+        model: "nova-2", smart_format: true, punctuate: true,
       });
       if (error) throw new Error("Deepgram error");
       extractedText = result.results.channels[0].alternatives[0].transcript;
@@ -94,33 +117,26 @@ export async function POST(req) {
       extractedText = pdfData.text;
     }
 
-    // Truncate text to fit context window if necessary
-    extractedText = extractedText.substring(0, 30000);
+    // Truncate text to fit context window
+    const truncatedText = extractedText.substring(0, 30000);
 
     // 4. GENERATE AI CONTENT
     console.log("🧠 Sending to Gemini...");
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     
-    // UPDATED PROMPT: Now asks for Formulas, Numericals, Summary, and Roadmap
+    // 🔥 PROMPT UPDATE: Explicit instructions for JSON safety
     const prompt = `
-      You are an expert teacher. Analyze this text and return a valid JSON object.
+      You are an expert teacher. Analyze this text and return a STRICTLY VALID JSON object.
       
-      STRUCTURE REQUIREMENTS:
-      1. **formulas**: Extract key mathematical formulas { "expression": "E=mc^2", "description": "..." }.
-      2. **quiz**: Exactly 5 conceptual multiple-choice questions (Theory).
-         - Difficulty: 2 Easy, 2 Medium, 1 Hard.
-      3. **numericals**: 
-         - IF formulas are found: Create a set for EACH formula.
-         - Inside each set: Exactly 6 math problems (1 Easy, 4 Medium, 1 Hard).
-         - IF NO formulas: Return empty array [].
-      4. **summary**: Concise summary.
-      5. **roadmap**: Learning steps.
+      CRITICAL INSTRUCTION FOR MATH/LATEX:
+      - If you include formulas with backslashes (like \\sigma, \\frac), you MUST escape them (e.g., \\\\sigma, \\\\frac).
+      - Do NOT output Markdown. Just the raw JSON string.
 
-      JSON FORMAT ONLY (No Markdown):
+      Structure:
       {
-        "summary": "...",
+        "summary": "Concise summary",
         "patterns": ["concept1", "concept2"],
-        "formulas": [ { "expression": "...", "description": "..." } ],
+        "formulas": [ { "expression": "E=mc^2", "description": "Energy-mass equivalence" } ],
         "quiz": [
           { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "difficulty": "medium", "explanation": "..." }
         ],
@@ -134,48 +150,36 @@ export async function POST(req) {
       }
       
       Text to analyze:
-      ${extractedText}
+      ${truncatedText}
     `;
 
     const result = await model.generateContent(prompt);
     const textResponse = result.response.text();
-    
-    // 5. Parse and Normalize Data
-    let aiData;
-    try {
-        aiData = extractJsonObjectSafe(textResponse);
-    } catch (e) {
-        console.error("JSON Parse Error", e);
-        // Fallback to basic object if AI fails completely
-        aiData = { summary: "AI generation failed", quiz: [], formulas: [], numericals: [] };
-    }
 
-    // 6. SAVE TO DB (One-shot create)
-    console.log("💾 Saving to MongoDB...");
-    
+    // 5. Parse and Normalize Data
+    // We use cleanAndParseJSON here instead of the old function
+    const aiData = cleanAndParseJSON(textResponse);
+
+    console.log("✅ Parsed Formulas Count:", aiData.formulas?.length || 0);
+    console.log("✅ Parsed Numericals Count:", aiData.numericals?.length || 0);
+
+    // 6. SAVE TO DB
     const newMemory = await Memory.create({
       title: file.name,
       mediaType: fileType,
       extractedText: extractedText,
-      
-      // Mapped Fields
+      mediaUrl: "https://example.com", 
       summary: aiData.summary || "",
       patterns: aiData.patterns || [],
       formulas: aiData.formulas || [],
       roadmap: aiData.roadmap || [],
-      
-      // Normalized Fields (Important for UI stability)
       quiz: normalizeQuiz(aiData.quiz),
       numericals: normalizeNumericals(aiData.numericals),
     });
 
-    console.log("✅ Success! Memory ID:", newMemory._id);
+    console.log("💾 Saved Memory ID:", newMemory._id);
     
-    return NextResponse.json({ 
-      success: true, 
-      id: newMemory._id, 
-      message: "Processing Complete" 
-    });
+    return NextResponse.json({ success: true, id: newMemory._id });
 
   } catch (error) {
     console.error("❌ Error:", error);

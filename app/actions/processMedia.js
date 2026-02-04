@@ -27,13 +27,40 @@ const MAX_AI_CHARS = 20_000;
 
 /* ---------------- HELPERS ---------------- */
 
+// Safe JSON extractor (handles markdown blocks AND fixes LaTeX backslashes)
 function extractJsonObjectSafe(text) {
-  if (!text) throw new Error("Empty AI response");
-  // Remove markdown code blocks if present
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  const match = cleaned.match(/\{[\s\S]*\}/); // Find first JSON object
-  if (!match) throw new Error("No JSON object found");
-  return JSON.parse(match[0]);
+  // 1. Remove markdown code blocks
+  let cleaned = text.replace(/```json|```/g, "").trim();
+
+  // 2. Find the first JSON object '{...}'
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  
+  if (start === -1 || end === -1) {
+    throw new Error("No JSON object found in AI response");
+  }
+
+  // Extract just the JSON part
+  cleaned = cleaned.substring(start, end + 1);
+
+  try {
+    // Try parsing normally first
+    return JSON.parse(cleaned);
+  } catch (error) {
+    console.warn("⚠️ Standard JSON parse failed. Attempting to sanitize LaTeX/Math...");
+
+    // 3. FIX: Escape backslashes that are strictly part of Math/LaTeX
+    // This regex looks for backslashes that are NOT followed by valid JSON escape chars (", \, /, b, f, n, r, t, u)
+    // It turns "\frac" into "\\frac" automatically.
+    const sanitized = cleaned.replace(/\\(?![/u"\\bfnrt])/g, '\\\\');
+
+    try {
+      return JSON.parse(sanitized);
+    } catch (secondError) {
+      console.error("❌ Failed to parse even after sanitization:", sanitized.substring(0, 200) + "...");
+      throw new Error("AI generated invalid JSON syntax (likely complex math formulas).");
+    }
+  }
 }
 
 function extractJsonArraySafe(text) {
