@@ -6,7 +6,7 @@ import { createClient } from '@deepgram/sdk';
 import { getDocumentProxy, extractText } from 'unpdf';
 
 // ✅ CRITICAL: Allow 60s timeout for mobile uploads
-export const maxDuration = 60; 
+export const maxDuration = 60;
 export const dynamic = 'force-dynamic';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -29,12 +29,12 @@ async function generateWithCascade(prompt) {
     try {
       console.log(`🤖 Attempting generation with model: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
-      
+
       // Safety timeout: If AI takes > 25s, kill it and try next model
-      const timeoutPromise = new Promise((_, reject) => 
+      const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("AI Generation Timeout")), 25000)
       );
-      
+
       const result = await Promise.race([
         model.generateContent(prompt),
         timeoutPromise
@@ -42,13 +42,13 @@ async function generateWithCascade(prompt) {
 
       const response = result.response.text();
       if (response) return response;
-      
+
     } catch (error) {
       console.warn(`⚠️ Model ${modelName} failed/skipped:`, error.message);
       lastError = error;
     }
   }
-  
+
   throw new Error(`All AI models failed. Last error: ${lastError?.message}`);
 }
 
@@ -57,9 +57,9 @@ function cleanAndParseJSON(text) {
   let cleaned = text.replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
-  
+
   if (start === -1 || end === -1) throw new Error("No JSON object found in AI response");
-  
+
   cleaned = cleaned.substring(start, end + 1);
 
   try {
@@ -82,15 +82,15 @@ function normalizeQuiz(quiz = []) {
     if (!q?.question || !Array.isArray(q.options)) return null;
     const options = q.options.map((o) => String(o).trim());
     let correct = (q.correctAnswer || "").toString().trim();
-    
+
     // Fix "A/B/C/D" answers to the actual text
     if (/^[A-D]$/i.test(correct)) {
       const index = correct.toUpperCase().charCodeAt(0) - 65;
       correct = options[index] ?? options[0];
     }
-    
+
     const matchedOption = options.find((opt) => opt.toLowerCase() === correct.toLowerCase()) || options[0];
-    
+
     return {
       question: q.question.trim(),
       options,
@@ -102,14 +102,14 @@ function normalizeQuiz(quiz = []) {
 }
 
 function normalizeNumericals(numericals = []) {
-    if (!Array.isArray(numericals)) return [];
-    return numericals.map(set => {
-        if (!set.relatedFormula || !Array.isArray(set.problems)) return null;
-        return {
-            relatedFormula: set.relatedFormula,
-            problems: normalizeQuiz(set.problems)
-        };
-    }).filter(Boolean);
+  if (!Array.isArray(numericals)) return [];
+  return numericals.map(set => {
+    if (!set.relatedFormula || !Array.isArray(set.problems)) return null;
+    return {
+      relatedFormula: set.relatedFormula,
+      problems: normalizeQuiz(set.problems)
+    };
+  }).filter(Boolean);
 }
 
 /* ---------------- MAIN HANDLER ---------------- */
@@ -117,7 +117,7 @@ function normalizeNumericals(numericals = []) {
 export async function POST(req) {
   try {
     await connectDB();
-    
+
     const body = await req.json();
     const { fileUrl, mediaType } = body;
 
@@ -141,39 +141,40 @@ export async function POST(req) {
         console.error("Transcription Failed:", err);
         throw new Error("Failed to transcribe video audio.");
       }
-    } 
+    }
     else if (type === 'pdf') {
       try {
         // Fetch with a timeout so huge files don't hang the server forever
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s download limit
-        
+
         const res = await fetch(fileUrl, { signal: controller.signal });
         clearTimeout(timeoutId);
-        
+
         if (!res.ok) throw new Error("Failed to fetch PDF");
 
         // ✅ Check Size: Allow up to 32MB (matching UploadThing)
         const contentLength = res.headers.get('content-length');
-        if (contentLength && parseInt(contentLength) > 32 * 1024 * 1024) {
-             throw new Error("File is too large (Max 32MB).");
+        // ✅ CHANGE THIS: Match your frontend limit (64MB)
+        if (contentLength && parseInt(contentLength) > 64 * 1024 * 1024) {
+          throw new Error("File is too large (Max 64MB).");
         }
 
         const arrayBuffer = await res.arrayBuffer();
         const pdfProxy = await getDocumentProxy(new Uint8Array(arrayBuffer));
-        
+
         // ✅ CRITICAL SAFETY: Only read first 5 pages for Mobile Scans
         // Mobile scans are essentially heavy images. Parsing 20 pages = OOM Crash.
-        const maxPages = Math.min(pdfProxy.numPages, 5); 
+        const maxPages = Math.min(pdfProxy.numPages, 5);
         console.log(`📄 PDF has ${pdfProxy.numPages} pages. Reading first ${maxPages} to save memory.`);
 
         let textParts = [];
-        for(let i = 1; i <= maxPages; i++) {
-           const { text } = await extractText(pdfProxy, { mergePages: false, range: [i, i] });
-           if(text) textParts.push(text);
+        for (let i = 1; i <= maxPages; i++) {
+          const { text } = await extractText(pdfProxy, { mergePages: false, range: [i, i] });
+          if (text) textParts.push(text);
         }
         extractedText = textParts.join("\n");
-        
+
       } catch (err) {
         console.error("PDF Parse Failed:", err);
         throw new Error(`PDF Error: ${err.message}`);
@@ -182,8 +183,8 @@ export async function POST(req) {
 
     // --- 2. VALIDATION ---
     if (!extractedText || extractedText.trim().length < 50) {
-      return NextResponse.json({ 
-        error: "Could not extract enough text. If this is a scanned PDF, ensure it has selectable text." 
+      return NextResponse.json({
+        error: "Could not extract enough text. If this is a scanned PDF, ensure it has selectable text."
       }, { status: 422 });
     }
 
@@ -192,7 +193,7 @@ export async function POST(req) {
 
     // --- 3. AI PROMPT ---
     console.log("🧠 Sending to AI...");
-    
+
     const prompt = `
       You are an expert teacher. Analyze this text and return a STRICTLY VALID JSON object.
       
@@ -239,7 +240,7 @@ export async function POST(req) {
     const aiData = cleanAndParseJSON(textResponse);
 
     console.log("💾 Saving to Database...");
-    
+
     const newMemory = await Memory.create({
       title: "New Memory",
       mediaType: type,
