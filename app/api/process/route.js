@@ -3,67 +3,77 @@ import connectDB from '@/lib/db';
 import Memory from '@/models/Memory';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@deepgram/sdk';
-import pdf from 'pdf-parse';
+import { getDocumentProxy, extractText } from 'unpdf';
 
-// Initialize AI Clients
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
+// Define your model cascade priority here
+const MODEL_CASCADE = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemma-3-12b-it", 
+  "gemma-3-1b-it"
+];
+
 /* ---------------- HELPERS ---------------- */
 
-// 🔧 THE FIX: A Robust JSON Cleaner for AI Responses
-function cleanAndParseJSON(text) {
-  // 1. Remove Markdown code blocks (```json ... ```)
-  let cleaned = text.replace(/```json|```/g, "").trim();
+// Helper to implement the cascade logic
+async function generateWithCascade(prompt) {
+  let lastError = null;
 
-  // 2. Extract just the JSON object (from first { to last })
+  for (const modelName of MODEL_CASCADE) {
+    try {
+      console.log(`🤖 Attempting generation with model: ${modelName}`);
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent(prompt);
+      const response = result.response.text();
+      
+      if (response) return response;
+      
+    } catch (error) {
+      console.warn(`⚠️ Model ${modelName} failed/skipped:`, error.message);
+      lastError = error;
+      // Continue to the next model in the list
+    }
+  }
+  
+  // If loop finishes without returning, throw the last error
+  throw new Error(`All AI models failed. Last error: ${lastError?.message}`);
+}
+
+function cleanAndParseJSON(text) {
+  let cleaned = text.replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
-  
-  // If no JSON found, throw error to trigger the catch block
   if (start === -1 || end === -1) throw new Error("No JSON object found");
-  
   cleaned = cleaned.substring(start, end + 1);
 
   try {
-    // Attempt 1: Direct Parse
     return JSON.parse(cleaned);
   } catch (e) {
-    console.log("⚠️ Direct JSON parse failed (likely LaTeX). Attempting to sanitize...");
-
-    // 3. SANITIZATION: Fix common AI JSON mistakes
-    // This Regex finds backslashes (\) that are NOT followed by valid JSON escape chars 
-    // and turns them into double backslashes (\\). 
-    // Example: "\sigma" becomes "\\sigma"
+    // Attempt basic cleanup for escaped characters
     const sanitized = cleaned.replace(/\\(?![/u"\\bfnrt])/g, '\\\\');
-
     try {
       return JSON.parse(sanitized);
     } catch (e2) {
-      console.error("❌ Fatal JSON Parse Error. Raw Text:", text);
+      console.error("❌ Fatal JSON Parse Error:", text);
       throw new Error("Failed to parse AI response.");
     }
   }
 }
 
-// Normalize Quiz Data
 function normalizeQuiz(quiz = []) {
   if (!Array.isArray(quiz)) return [];
   return quiz.map((q) => {
     if (!q?.question || !Array.isArray(q.options)) return null;
-
     const options = q.options.map((o) => String(o).trim());
     let correct = (q.correctAnswer || "").toString().trim();
-
-    // Map "A/B/C/D" to actual option text
     if (/^[A-D]$/i.test(correct)) {
       const index = correct.toUpperCase().charCodeAt(0) - 65;
       correct = options[index] ?? options[0];
     }
-    
-    // Ensure correct answer matches one of the options
     const matchedOption = options.find((opt) => opt.toLowerCase() === correct.toLowerCase()) || options[0];
-
     return {
       question: q.question.trim(),
       options,
@@ -74,14 +84,13 @@ function normalizeQuiz(quiz = []) {
   }).filter(Boolean);
 }
 
-// Normalize Numerical Data
 function normalizeNumericals(numericals = []) {
     if (!Array.isArray(numericals)) return [];
     return numericals.map(set => {
         if (!set.relatedFormula || !Array.isArray(set.problems)) return null;
         return {
             relatedFormula: set.relatedFormula,
-            problems: normalizeQuiz(set.problems) // Reuse quiz logic
+            problems: normalizeQuiz(set.problems)
         };
     }).filter(Boolean);
 }
@@ -90,99 +99,121 @@ function normalizeNumericals(numericals = []) {
 
 export async function POST(req) {
   try {
-    // 1. Connect to Database
     await connectDB();
     
-    // 2. Handle File Upload
-    const formData = await req.formData();
-    const file = formData.get('file');
-    const fileType = formData.get('type'); 
+    const body = await req.json();
+    const { fileUrl, mediaType } = body;
 
-    if (!file) return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
+    if (!fileUrl) return NextResponse.json({ error: "No file URL provided" }, { status: 400 });
 
-    const buffer = Buffer.from(await file.arrayBuffer());
     let extractedText = "";
+    const type = mediaType ? mediaType.toLowerCase() : "unknown";
 
-    // 3. Extract Text
-    console.log("🔍 Extracting text from", fileType);
-    if (fileType === 'video') {
-      const { result, error } = await deepgram.listen.prerecorded.transcribeFile(buffer, {
-        model: "nova-2", smart_format: true, punctuate: true,
-      });
-      if (error) throw new Error("Deepgram error");
-      extractedText = result.results.channels[0].alternatives[0].transcript;
+    console.log(`🔍 Processing [${type}] from URL:`, fileUrl);
+
+    // Extraction Logic
+    if (type === 'video') {
+      try {
+        const { result, error } = await deepgram.listen.prerecorded.transcribeUrl(
+          { url: fileUrl },
+          { model: "nova-2", smart_format: true, punctuate: true }
+        );
+        if (error) throw new Error("Deepgram error: " + error.message);
+        extractedText = result?.results?.channels[0]?.alternatives[0]?.transcript || "";
+      } catch (err) {
+        console.error("Deepgram Transcription Failed:", err);
+        throw new Error("Failed to transcribe video audio.");
+      }
     } 
-    else if (fileType === 'pdf') {
-      const pdfData = await pdf(buffer);
-      extractedText = pdfData.text;
+    else if (type === 'pdf') {
+      try {
+        const res = await fetch(fileUrl);
+        if (!res.ok) throw new Error("Failed to fetch PDF from storage");
+        
+        const arrayBuffer = await res.arrayBuffer();
+        const pdfProxy = await getDocumentProxy(new Uint8Array(arrayBuffer));
+        const { text } = await extractText(pdfProxy, { mergePages: true });
+        
+        extractedText = text || "";
+      } catch (err) {
+        console.error("PDF Parse Failed:", err);
+        throw new Error("Failed to read PDF text. Is it a scanned image?");
+      }
     }
 
-    // Truncate text to fit context window
+    // Validation
+    console.log("📝 Extracted Text Length:", extractedText.length);
+    
+    if (!extractedText || extractedText.trim().length < 50) {
+      return NextResponse.json({ 
+        error: "Could not extract enough text. If this is a PDF, ensure it has selectable text." 
+      }, { status: 422 });
+    }
+
     const truncatedText = extractedText.substring(0, 30000);
 
-    // 4. GENERATE AI CONTENT
-    console.log("🧠 Sending to Gemini...");
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    // 4. GENERATE AI CONTENT WITH CASCADE & READABLE FORMULAS
+    console.log("🧠 Sending to Gemini (Cascade Mode)...");
     
-    // 🔥 PROMPT UPDATE: Explicit instructions for JSON safety
     const prompt = `
       You are an expert teacher. Analyze this text and return a STRICTLY VALID JSON object.
       
-      CRITICAL INSTRUCTION FOR MATH/LATEX:
-      - If you include formulas with backslashes (like \\sigma, \\frac), you MUST escape them (e.g., \\\\sigma, \\\\frac).
-      - Do NOT output Markdown. Just the raw JSON string.
+      CRITICAL INSTRUCTIONS FOR FORMULAS:
+      1. **READABILITY IS KEY:** Do NOT use complex LaTeX (like \\text{Density}) unless absolutely necessary.
+      2. **PREFER UNICODE:** Output formulas in standard readable text format.
+         - BAD: "\\text{Density} (\\text{Kg/m}^3)"
+         - GOOD: "Density (kg/m³)"
+         - GOOD: "E = mc²"
+      3. If you MUST use LaTeX for complex math, you MUST escape backslashes (e.g., \\\\frac).
+      
+      Do NOT output Markdown. Just the raw JSON string.
 
       Structure:
       {
         "summary": "Concise summary",
         "patterns": ["concept1", "concept2"],
-        "formulas": [ { "expression": "E=mc^2", "description": "Energy-mass equivalence" } ],
+        "formulas": [ { "expression": "Density (kg/m³)", "description": "Formula for density" } ],
         "quiz": [
           { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "difficulty": "medium", "explanation": "..." }
         ],
         "numericals": [
-          {
-            "relatedFormula": "F = m*a",
-            "problems": [ ...same structure as quiz... ]
-          }
+          { "relatedFormula": "F = m*a", "problems": [ { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "explanation": "..." } ] }
         ],
-        "roadmap": [ { "step": 1, "title": "...", "description": "..." } ]
+        "roadmap": [ { "step": 1, "title": "...", "description": "..." } ],
+        "diagram": "graph TD; A[Start] --> B[End];"
       }
       
       Text to analyze:
       ${truncatedText}
     `;
 
-    const result = await model.generateContent(prompt);
-    const textResponse = result.response.text();
-
-    // 5. Parse and Normalize Data
-    // We use cleanAndParseJSON here instead of the old function
+    // Use the cascade helper instead of calling model directly
+    const textResponse = await generateWithCascade(prompt);
+    
     const aiData = cleanAndParseJSON(textResponse);
 
-    console.log("✅ Parsed Formulas Count:", aiData.formulas?.length || 0);
-    console.log("✅ Parsed Numericals Count:", aiData.numericals?.length || 0);
-
-    // 6. SAVE TO DB
+    // 5. SAVE TO DB
+    console.log("💾 Saving to Database...");
+    
     const newMemory = await Memory.create({
-      title: file.name,
-      mediaType: fileType,
+      title: "New Memory",
+      mediaType: type,
+      mediaUrl: fileUrl,
       extractedText: extractedText,
-      mediaUrl: "https://example.com", 
-      summary: aiData.summary || "",
+      summary: aiData.summary || "No summary generated",
       patterns: aiData.patterns || [],
       formulas: aiData.formulas || [],
       roadmap: aiData.roadmap || [],
       quiz: normalizeQuiz(aiData.quiz),
       numericals: normalizeNumericals(aiData.numericals),
+      diagram: aiData.diagram || ""
     });
 
-    console.log("💾 Saved Memory ID:", newMemory._id);
-    
+    console.log("✅ Success! ID:", newMemory._id);
     return NextResponse.json({ success: true, id: newMemory._id });
 
   } catch (error) {
-    console.error("❌ Error:", error);
+    console.error("❌ Processing Error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

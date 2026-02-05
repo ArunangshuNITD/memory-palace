@@ -10,16 +10,28 @@ import {
   Loader2,
   CheckCircle,
 } from "lucide-react";
-import { processMedia } from "./actions/processMedia";
+
+// 1. Import UploadThing Helper
+import { generateReactHelpers } from "@uploadthing/react";
+
+// Initialize hook
+const { useUploadThing } = generateReactHelpers();
 
 export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
-  const [statusMessage, setStatusMessage] = useState(
-    "Constructing your Palace..."
-  );
-
+  const [statusMessage, setStatusMessage] = useState("Constructing your Palace...");
+  
   const router = useRouter();
+
+  // 2. Setup UploadThing Hook
+  const { startUpload } = useUploadThing("mediaUploader", {
+    onUploadError: (error) => {
+        console.error(error);
+        alert("Upload failed: " + error.message);
+        setIsProcessing(false);
+    }
+  });
 
   /* ---------------- UPLOAD HANDLER ---------------- */
   const handleUpload = async (e, mediaType) => {
@@ -28,28 +40,54 @@ export default function Home() {
 
     setIsProcessing(true);
     setIsSuccess(false);
-    setStatusMessage("Uploading and analyzing content...");
+    
+    // Step 1: Cloud Upload
+    setStatusMessage("Uploading to secure cloud storage...");
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("type", mediaType.toLowerCase()); // "pdf" | "video"
-
-      const result = await processMedia(formData);
-
-      if (result?.success) {
-        setStatusMessage("Memory created successfully!");
-        setIsSuccess(true);
-
-        // Let success animation play
-        setTimeout(() => {
-          router.push(`/memory/${result.id}`);
-        }, 1200);
-      } else {
-        throw new Error(result?.error || "Processing failed");
+      // A. Perform UploadThing Upload
+      const uploadRes = await startUpload([file]);
+      
+      if (!uploadRes || !uploadRes[0]) {
+          throw new Error("Cloud upload failed");
       }
+
+      const fileUrl = uploadRes[0].url;
+      console.log("✅ File uploaded to:", fileUrl);
+
+      // Step 2: Process AI
+      setStatusMessage(
+        mediaType === "video" 
+          ? "Transcribing audio & analyzing visuals..." 
+          : "Extracting text & patterns from PDF..."
+      );
+
+      // B. Send URL to our API
+      const response = await fetch("/api/process", {
+        method: "POST",
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+            fileUrl: fileUrl, 
+            mediaType: mediaType.toLowerCase() // "pdf" or "video"
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Processing failed");
+      }
+
+      // ✅ SUCCESS
+      setStatusMessage("Memory created! Redirecting...");
+      setIsSuccess(true);
+
+      setTimeout(() => {
+        router.push(`/memory/${result.id}`);
+      }, 1200);
+
     } catch (err) {
-      console.error("Upload error:", err);
+      console.error("Pipeline error:", err);
       alert(err.message || "Something went wrong");
       setIsProcessing(false);
     }
@@ -89,18 +127,19 @@ export default function Home() {
             </div>
             <h2 className="text-2xl font-bold text-slate-900">Upload PDF</h2>
 
-            <label className="mt-8 flex cursor-pointer flex-col items-center rounded-xl border-2 border-dashed border-indigo-100 bg-slate-50 py-6 hover:bg-indigo-50/50">
+            <label className="mt-8 flex cursor-pointer flex-col items-center rounded-xl border-2 border-dashed border-indigo-100 bg-slate-50 py-6 hover:bg-indigo-50/50 transition-colors">
               <UploadCloud className="mb-2 h-8 w-8 text-indigo-400" />
               <p className="text-sm font-medium text-slate-600">
                 Click to browse PDF
               </p>
-              <p className="text-xs text-slate-400">up to 10MB</p>
+              <p className="text-xs text-slate-400">up to 16MB</p>
 
               <input
                 type="file"
                 className="hidden"
                 accept=".pdf"
                 onChange={(e) => handleUpload(e, "pdf")}
+                disabled={isProcessing}
               />
             </label>
           </div>
@@ -112,18 +151,19 @@ export default function Home() {
             </div>
             <h2 className="text-2xl font-bold text-slate-900">Upload Video</h2>
 
-            <label className="mt-8 flex cursor-pointer flex-col items-center rounded-xl border-2 border-dashed border-emerald-100 bg-slate-50 py-6 hover:bg-emerald-50/50">
+            <label className="mt-8 flex cursor-pointer flex-col items-center rounded-xl border-2 border-dashed border-emerald-100 bg-slate-50 py-6 hover:bg-emerald-50/50 transition-colors">
               <UploadCloud className="mb-2 h-8 w-8 text-emerald-400" />
               <p className="text-sm font-medium text-slate-600">
                 Click to browse Video
               </p>
-              <p className="text-xs text-slate-400">MP4, MOV, AVI</p>
+              <p className="text-xs text-slate-400">MP4, MOV, AVI (up to 64MB)</p>
 
               <input
                 type="file"
                 className="hidden"
                 accept="video/*"
                 onChange={(e) => handleUpload(e, "video")}
+                disabled={isProcessing}
               />
             </label>
           </div>
@@ -131,10 +171,12 @@ export default function Home() {
 
         {/* LOADING & SUCCESS OVERLAY */}
         {isProcessing && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/90 backdrop-blur-sm">
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/90 backdrop-blur-sm transition-all duration-300">
             <div className="flex flex-col items-center gap-6">
               {isSuccess ? (
-                <CheckCircle size={64} className="text-green-500" />
+                <div className="scale-110 transition-transform duration-300">
+                  <CheckCircle size={64} className="text-green-500" />
+                </div>
               ) : (
                 <Loader2 size={64} className="animate-spin text-indigo-600" />
               )}
