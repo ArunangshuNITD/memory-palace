@@ -5,20 +5,23 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@deepgram/sdk';
 import { getDocumentProxy, extractText } from 'unpdf';
 
+// ✅ FIX 1: Max Duration for Mobile Uploads
+export const maxDuration = 60;
+export const dynamic = 'force-dynamic';
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-// Define your model cascade priority here
+// ✅ UPDATED CASCADE
 const MODEL_CASCADE = [
+  "gemma-3-12b-it",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
-  "gemma-3-12b-it", 
   "gemma-3-1b-it"
 ];
 
 /* ---------------- HELPERS ---------------- */
 
-// Helper to implement the cascade logic
 async function generateWithCascade(prompt) {
   let lastError = null;
 
@@ -34,11 +37,9 @@ async function generateWithCascade(prompt) {
     } catch (error) {
       console.warn(`⚠️ Model ${modelName} failed/skipped:`, error.message);
       lastError = error;
-      // Continue to the next model in the list
     }
   }
   
-  // If loop finishes without returning, throw the last error
   throw new Error(`All AI models failed. Last error: ${lastError?.message}`);
 }
 
@@ -52,7 +53,6 @@ function cleanAndParseJSON(text) {
   try {
     return JSON.parse(cleaned);
   } catch (e) {
-    // Attempt basic cleanup for escaped characters
     const sanitized = cleaned.replace(/\\(?![/u"\\bfnrt])/g, '\\\\');
     try {
       return JSON.parse(sanitized);
@@ -130,14 +130,23 @@ export async function POST(req) {
         const res = await fetch(fileUrl);
         if (!res.ok) throw new Error("Failed to fetch PDF from storage");
         
+        // ✅ FIX 2: File Size Check (10MB Limit)
+        const contentLength = res.headers.get('content-length');
+        if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
+             throw new Error("File is too large (Max 10MB). Please compress it.");
+        }
+
         const arrayBuffer = await res.arrayBuffer();
         const pdfProxy = await getDocumentProxy(new Uint8Array(arrayBuffer));
-        const { text } = await extractText(pdfProxy, { mergePages: true });
+        
+        // Limit to 10 pages to avoid timeouts on mobile scans
+        const maxPages = Math.min(pdfProxy.numPages, 10);
+        const { text } = await extractText(pdfProxy, { mergePages: true }); // extractText handles logic usually, but we keep it simple
         
         extractedText = text || "";
       } catch (err) {
         console.error("PDF Parse Failed:", err);
-        throw new Error("Failed to read PDF text. Is it a scanned image?");
+        throw new Error(`PDF Error: ${err.message}`);
       }
     }
 
@@ -152,19 +161,17 @@ export async function POST(req) {
 
     const truncatedText = extractedText.substring(0, 30000);
 
-    // 4. GENERATE AI CONTENT WITH CASCADE & READABLE FORMULAS
     console.log("🧠 Sending to Gemini (Cascade Mode)...");
     
+    // ✅ FIX 3: Prompt updated for 5 numericals
     const prompt = `
       You are an expert teacher. Analyze this text and return a STRICTLY VALID JSON object.
       
-      CRITICAL INSTRUCTIONS FOR FORMULAS:
-      1. **READABILITY IS KEY:** Do NOT use complex LaTeX (like \\text{Density}) unless absolutely necessary.
-      2. **PREFER UNICODE:** Output formulas in standard readable text format.
-         - BAD: "\\text{Density} (\\text{Kg/m}^3)"
-         - GOOD: "Density (kg/m³)"
-         - GOOD: "E = mc²"
-      3. If you MUST use LaTeX for complex math, you MUST escape backslashes (e.g., \\\\frac).
+      CRITICAL INSTRUCTIONS:
+      1. **FORMULAS:** Prefer Unicode (e.g., "Density (kg/m³)") over complex LaTeX. Escape backslashes if using LaTeX.
+      2. **NUMERICALS (VERY IMPORTANT):** - Identify key formulas from the text.
+         - For EACH formula identified, you MUST generate **AT LEAST 5** distinct numerical practice problems.
+         - Vary the difficulty of these numericals.
       
       Do NOT output Markdown. Just the raw JSON string.
 
@@ -177,7 +184,16 @@ export async function POST(req) {
           { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "difficulty": "medium", "explanation": "..." }
         ],
         "numericals": [
-          { "relatedFormula": "F = m*a", "problems": [ { "question": "...", "options": ["A","B","C","D"], "correctAnswer": "A", "explanation": "..." } ] }
+          { 
+            "relatedFormula": "F = m*a", 
+            "problems": [ 
+               { "question": "Problem 1...", "options": ["A","B","C","D"], "correctAnswer": "A", "explanation": "..." },
+               { "question": "Problem 2...", "options": ["A","B","C","D"], "correctAnswer": "B", "explanation": "..." },
+               { "question": "Problem 3...", "options": ["A","B","C","D"], "correctAnswer": "C", "explanation": "..." },
+               { "question": "Problem 4...", "options": ["A","B","C","D"], "correctAnswer": "D", "explanation": "..." },
+               { "question": "Problem 5...", "options": ["A","B","C","D"], "correctAnswer": "A", "explanation": "..." }
+            ] 
+          }
         ],
         "roadmap": [ { "step": 1, "title": "...", "description": "..." } ],
         "diagram": "graph TD; A[Start] --> B[End];"
@@ -187,12 +203,10 @@ export async function POST(req) {
       ${truncatedText}
     `;
 
-    // Use the cascade helper instead of calling model directly
     const textResponse = await generateWithCascade(prompt);
     
     const aiData = cleanAndParseJSON(textResponse);
 
-    // 5. SAVE TO DB
     console.log("💾 Saving to Database...");
     
     const newMemory = await Memory.create({
