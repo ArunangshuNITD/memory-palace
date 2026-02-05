@@ -5,14 +5,14 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@deepgram/sdk';
 import { getDocumentProxy, extractText } from 'unpdf';
 
-// ✅ FIX 1: Max Duration for Mobile Uploads
-export const maxDuration = 60;
+// ✅ CRITICAL: Allow 60s timeout for mobile uploads
+export const maxDuration = 60; 
 export const dynamic = 'force-dynamic';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-// ✅ UPDATED CASCADE
+// ✅ MODEL CASCADE: Intelligent fallback
 const MODEL_CASCADE = [
   "gemma-3-12b-it",
   "gemini-2.5-flash",
@@ -29,9 +29,18 @@ async function generateWithCascade(prompt) {
     try {
       console.log(`🤖 Attempting generation with model: ${modelName}`);
       const model = genAI.getGenerativeModel({ model: modelName });
-      const result = await model.generateContent(prompt);
-      const response = result.response.text();
       
+      // Safety timeout: If AI takes > 25s, kill it and try next model
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("AI Generation Timeout")), 25000)
+      );
+      
+      const result = await Promise.race([
+        model.generateContent(prompt),
+        timeoutPromise
+      ]);
+
+      const response = result.response.text();
       if (response) return response;
       
     } catch (error) {
@@ -44,20 +53,24 @@ async function generateWithCascade(prompt) {
 }
 
 function cleanAndParseJSON(text) {
+  // Remove markdown code blocks
   let cleaned = text.replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error("No JSON object found");
+  
+  if (start === -1 || end === -1) throw new Error("No JSON object found in AI response");
+  
   cleaned = cleaned.substring(start, end + 1);
 
   try {
     return JSON.parse(cleaned);
   } catch (e) {
+    // Basic cleanup for unescaped characters which sometimes happens
     const sanitized = cleaned.replace(/\\(?![/u"\\bfnrt])/g, '\\\\');
     try {
       return JSON.parse(sanitized);
     } catch (e2) {
-      console.error("❌ Fatal JSON Parse Error:", text);
+      console.error("❌ Fatal JSON Parse Error. Response was:", text);
       throw new Error("Failed to parse AI response.");
     }
   }
@@ -69,11 +82,15 @@ function normalizeQuiz(quiz = []) {
     if (!q?.question || !Array.isArray(q.options)) return null;
     const options = q.options.map((o) => String(o).trim());
     let correct = (q.correctAnswer || "").toString().trim();
+    
+    // Fix "A/B/C/D" answers to the actual text
     if (/^[A-D]$/i.test(correct)) {
       const index = correct.toUpperCase().charCodeAt(0) - 65;
       correct = options[index] ?? options[0];
     }
+    
     const matchedOption = options.find((opt) => opt.toLowerCase() === correct.toLowerCase()) || options[0];
+    
     return {
       question: q.question.trim(),
       options,
@@ -111,7 +128,7 @@ export async function POST(req) {
 
     console.log(`🔍 Processing [${type}] from URL:`, fileUrl);
 
-    // Extraction Logic
+    // --- 1. EXTRACTION LOGIC ---
     if (type === 'video') {
       try {
         const { result, error } = await deepgram.listen.prerecorded.transcribeUrl(
@@ -121,57 +138,71 @@ export async function POST(req) {
         if (error) throw new Error("Deepgram error: " + error.message);
         extractedText = result?.results?.channels[0]?.alternatives[0]?.transcript || "";
       } catch (err) {
-        console.error("Deepgram Transcription Failed:", err);
+        console.error("Transcription Failed:", err);
         throw new Error("Failed to transcribe video audio.");
       }
     } 
     else if (type === 'pdf') {
       try {
-        const res = await fetch(fileUrl);
-        if (!res.ok) throw new Error("Failed to fetch PDF from storage");
+        // Fetch with a timeout so huge files don't hang the server forever
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s download limit
         
-        // ✅ FIX 2: File Size Check (10MB Limit)
+        const res = await fetch(fileUrl, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
+        if (!res.ok) throw new Error("Failed to fetch PDF");
+
+        // ✅ Check Size: Allow up to 32MB (matching UploadThing)
         const contentLength = res.headers.get('content-length');
-        if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
-             throw new Error("File is too large (Max 10MB). Please compress it.");
+        if (contentLength && parseInt(contentLength) > 32 * 1024 * 1024) {
+             throw new Error("File is too large (Max 32MB).");
         }
 
         const arrayBuffer = await res.arrayBuffer();
         const pdfProxy = await getDocumentProxy(new Uint8Array(arrayBuffer));
         
-        // Limit to 10 pages to avoid timeouts on mobile scans
-        const maxPages = Math.min(pdfProxy.numPages, 10);
-        const { text } = await extractText(pdfProxy, { mergePages: true }); // extractText handles logic usually, but we keep it simple
+        // ✅ CRITICAL SAFETY: Only read first 5 pages for Mobile Scans
+        // Mobile scans are essentially heavy images. Parsing 20 pages = OOM Crash.
+        const maxPages = Math.min(pdfProxy.numPages, 5); 
+        console.log(`📄 PDF has ${pdfProxy.numPages} pages. Reading first ${maxPages} to save memory.`);
+
+        let textParts = [];
+        for(let i = 1; i <= maxPages; i++) {
+           const { text } = await extractText(pdfProxy, { mergePages: false, range: [i, i] });
+           if(text) textParts.push(text);
+        }
+        extractedText = textParts.join("\n");
         
-        extractedText = text || "";
       } catch (err) {
         console.error("PDF Parse Failed:", err);
         throw new Error(`PDF Error: ${err.message}`);
       }
     }
 
-    // Validation
-    console.log("📝 Extracted Text Length:", extractedText.length);
-    
+    // --- 2. VALIDATION ---
     if (!extractedText || extractedText.trim().length < 50) {
       return NextResponse.json({ 
-        error: "Could not extract enough text. If this is a PDF, ensure it has selectable text." 
+        error: "Could not extract enough text. If this is a scanned PDF, ensure it has selectable text." 
       }, { status: 422 });
     }
 
-    const truncatedText = extractedText.substring(0, 30000);
+    // Truncate to avoid token limits
+    const truncatedText = extractedText.substring(0, 25000);
 
-    console.log("🧠 Sending to Gemini (Cascade Mode)...");
+    // --- 3. AI PROMPT ---
+    console.log("🧠 Sending to AI...");
     
-    // ✅ FIX 3: Prompt updated for 5 numericals
     const prompt = `
       You are an expert teacher. Analyze this text and return a STRICTLY VALID JSON object.
       
       CRITICAL INSTRUCTIONS:
-      1. **FORMULAS:** Prefer Unicode (e.g., "Density (kg/m³)") over complex LaTeX. Escape backslashes if using LaTeX.
-      2. **NUMERICALS (VERY IMPORTANT):** - Identify key formulas from the text.
-         - For EACH formula identified, you MUST generate **AT LEAST 5** distinct numerical practice problems.
-         - Vary the difficulty of these numericals.
+      1. **FORMULAS:** - Use readable text format (e.g., "Density (kg/m³)" or "E = mc²"). 
+         - Do NOT use complex LaTeX code like \\text{Density} or \\frac.
+      
+      2. **NUMERICALS (MANDATORY):** - Identify the key formulas in the text.
+         - For EACH formula, generate **AT LEAST 5** distinct practice problems.
+         - Vary the difficulty (Easy, Medium, Hard).
       
       Do NOT output Markdown. Just the raw JSON string.
 
@@ -203,8 +234,8 @@ export async function POST(req) {
       ${truncatedText}
     `;
 
+    // --- 4. GENERATE & SAVE ---
     const textResponse = await generateWithCascade(prompt);
-    
     const aiData = cleanAndParseJSON(textResponse);
 
     console.log("💾 Saving to Database...");
